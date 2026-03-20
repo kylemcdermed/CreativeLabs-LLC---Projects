@@ -21,7 +21,7 @@ import { processMessage } from "../../utils/memoryService";
 // ============================================================
 // CONFIG
 // ============================================================
-const GROQ_API_KEY = "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";
+const GROQ_API_KEY = "";
 const USER_NAME    = "Kyle";
 const GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_FAST    = "llama-3.1-8b-instant";
