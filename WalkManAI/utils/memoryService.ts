@@ -195,13 +195,13 @@ export async function processMessage(
   // Skip very short messages — not enough content to extract memory from
   const wordCount = userText.trim().split(/\s+/).length;
   if (wordCount < 5) {
-    printMemorySnapshot(profile, []);
+  // skip - no new memories
     return { profile, newMemories };
   }
 
   const extracted = await extractMemory(userText, apiKey);
   if (!extracted) {
-    printMemorySnapshot(profile, []);
+  // skip - no new memories
     return { profile, newMemories };
   }
 
@@ -322,7 +322,14 @@ export async function processMessage(
   profile = checkPromotions(profile);
   profile.last_session = now;
 
-  printMemorySnapshot(profile, newMemories);
+  // Only print new detections
+  if (newMemories.length > 0) {
+    console.log("\n✨ NEW FROM THIS MESSAGE:");
+    newMemories.forEach(item => console.log(`     + ${item}`));
+    console.log('');
+  } else {
+    console.log("💭 Nothing new detected");
+  }
   return { profile, newMemories };
 }
 
