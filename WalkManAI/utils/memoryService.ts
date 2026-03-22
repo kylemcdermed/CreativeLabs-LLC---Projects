@@ -1,36 +1,25 @@
 // ============================================================
 // WalkManAI — Memory Service
-// Single Groq call, clean terminal output
+// Single Groq call extracts and classifies memory
 // ============================================================
 
 import {
   UserProfile,
-  checkPromotions,
-  newEntry,
-  purgeExpired,
+  addMemory,
+  purgeExpired
 } from "./memory";
 
 const GROQ_URL  = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_FAST = "llama-3.1-8b-instant";
 
-const BRAIN_LABELS: Record<string, string> = {
-  neocortex:     "NEOCORTEX        — Long term | Permanent | General facts about who you are",
-  amygdala:      "AMYGDALA         — Long term | Permanent | Emotional memories (trauma, joy, attachments)",
-  basal_ganglia: "BASAL GANGLIA    — Long term | Permanent | Habits, interests, dislikes",
-  cerebellum:    "CEREBELLUM       — Intermediate | ~30 days | New skills being learned",
-  hippocampus:   "HIPPOCAMPUS      — Fluid | Short→Mid→Long | Personal events and stories",
-  keywords:      "KEYWORD INDEX    — Short term | 7 days | Named people, places, companies",
-};
-
-// ── Single Groq call to extract all memory ────────────────
 async function extractMemory(text: string, apiKey: string): Promise<any | null> {
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 15000);
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 15000);
 
     const res = await fetch(GROQ_URL, {
       method: "POST",
-      signal: controller.signal,
+      signal: ctrl.signal,
       headers: {
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
@@ -42,45 +31,38 @@ async function extractMemory(text: string, apiKey: string): Promise<any | null> 
         messages: [
           {
             role: "system",
-            content: `You are a memory extraction system listening to what a HUMAN USER says to an AI friend.
-Extract facts about the HUMAN SPEAKER ONLY — never about the AI named Julia.
-The human may say they are building an app, doing a project, taking a test — those are facts about THEM.
-Return ONLY raw JSON, no markdown, no explanation.
+            content: `You extract memory from what a HUMAN says to an AI friend. Focus on the HUMAN SPEAKER only.
 
+Return ONLY raw JSON — no markdown, no explanation:
 {
   "name": null,
   "age": null,
   "occupation": null,
   "location": null,
-  "general_fact": null,
-  "trauma": null,
-  "joy": null,
-  "attachment": null,
-  "habit": null,
-  "interest": null,
-  "dislike": null,
-  "skill": null,
-  "event": null,
+  "goal": null,
+  "value": null,
+  "fear": null,
+  "achievement": null,
+  "relationship": null,
+  "identity_fact": null,
+  "intermediate_topic": null,
+  "fleeting_note": null,
   "keywords": []
 }
 
 Rules:
-- Only extract clear, definitive facts — not guesses
-- name: speaker's first name if they say it
-- age: only if they clearly state their current age
-- occupation: their job
-- location: where they live
-- general_fact: permanent fact about who they are
-- trauma: deep pain or loss they experienced
-- joy: proud moment or achievement
-- attachment: person or thing they deeply love
-- habit: something they do regularly
-- interest: passion or hobby
-- dislike: something they hate
-- skill: something they are learning or building right now
-- event: a specific story or thing that happened to them
-- keywords: named people, places, companies (max 3, never "you", never "Julia", never "I")
-- If the message is too short or unclear to extract anything meaningful, return all nulls and empty array`
+- name/age/occupation/location: basic profile facts about the speaker
+- goal: something they are working toward or want to achieve
+- value: something they deeply care about or believe in
+- fear: a deep worry, trauma, or thing that troubles them
+- achievement: a win, proud moment, or milestone they accomplished
+- relationship: a person important to them (family, friend, colleague)
+- identity_fact: a permanent fact that defines who they are as a person
+- intermediate_topic: an ongoing topic/vent/situation (not permanent but recurring)
+- fleeting_note: something said in passing, daily event, not important long term
+- keywords: named people, places, companies mentioned (max 3)
+- If nothing found for a field return null
+- Never extract facts about the AI named Julia`
           },
           { role: "user", content: text }
         ]
@@ -97,253 +79,153 @@ Rules:
   }
 }
 
-// ── Clean formatted memory snapshot ──────────────────────
-function printMemorySnapshot(profile: UserProfile, newItems: string[]) {
-  console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-  console.log("🧠 JULIA MEMORY PROFILE");
-  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-
-  console.log(`\n📌 ${BRAIN_LABELS.neocortex}`);
-  console.log(`   Name: ${profile.neocortex.name || "unknown"}`);
-  console.log(`   Age: ${profile.neocortex.age || "unknown"}`);
-  console.log(`   Occupation: ${profile.neocortex.occupation || "unknown"}`);
-  console.log(`   Location: ${profile.neocortex.location || "unknown"}`);
-  if (profile.neocortex.facts.length > 0) {
-    console.log(`   Facts:`);
-    profile.neocortex.facts.slice(-5).forEach(f => console.log(`     • ${f.text}`));
-  }
-
-  console.log(`\n❤️  ${BRAIN_LABELS.amygdala}`);
-  if (profile.amygdala.traumas.length > 0) {
-    console.log(`   Traumas/Pain:`);
-    profile.amygdala.traumas.forEach(t => console.log(`     • ${t.text}`));
-  }
-  if (profile.amygdala.joys.length > 0) {
-    console.log(`   Joys/Achievements:`);
-    profile.amygdala.joys.forEach(j => console.log(`     • ${j.text}`));
-  }
-  if (profile.amygdala.attachments.length > 0) {
-    console.log(`   Attachments:`);
-    profile.amygdala.attachments.forEach(a => console.log(`     • ${a.text}`));
-  }
-  if (profile.amygdala.traumas.length === 0 && profile.amygdala.joys.length === 0 && profile.amygdala.attachments.length === 0) {
-    console.log(`   (none yet)`);
-  }
-
-  console.log(`\n🎯 ${BRAIN_LABELS.basal_ganglia}`);
-  if (profile.basal_ganglia.habits.length > 0) {
-    console.log(`   Habits:`);
-    profile.basal_ganglia.habits.forEach(h => console.log(`     • ${h.text}`));
-  }
-  if (profile.basal_ganglia.interests.length > 0) {
-    console.log(`   Interests:`);
-    profile.basal_ganglia.interests.forEach(i => console.log(`     • ${i.text}`));
-  }
-  if (profile.basal_ganglia.dislikes.length > 0) {
-    console.log(`   Dislikes:`);
-    profile.basal_ganglia.dislikes.forEach(d => console.log(`     • ${d.text}`));
-  }
-  if (profile.basal_ganglia.habits.length === 0 && profile.basal_ganglia.interests.length === 0 && profile.basal_ganglia.dislikes.length === 0) {
-    console.log(`   (none yet)`);
-  }
-
-  console.log(`\n🏋️  ${BRAIN_LABELS.cerebellum}`);
-  if (profile.cerebellum.skills.length > 0) {
-    profile.cerebellum.skills.forEach(s => console.log(`     • ${s.text}`));
-  } else {
-    console.log(`   (none yet)`);
-  }
-
-  console.log(`\n📖 ${BRAIN_LABELS.hippocampus}`);
-  if (profile.hippocampus.events.length > 0) {
-    profile.hippocampus.events.slice(-5).forEach(e => console.log(`     • ${e.text}`));
-  } else {
-    console.log(`   (none yet)`);
-  }
-
-  console.log(`\n🔑 ${BRAIN_LABELS.keywords}`);
-  const filtered = profile.keywords.filter(
-    k => !["you", "julia", "i", "me", "we"].includes(k.word.toLowerCase())
-  );
-  if (filtered.length > 0) {
-    filtered.forEach(k => console.log(`     • ${k.word} (seen ${k.times_seen}x, tier: ${k.tier})`));
-  } else {
-    console.log(`   (none yet)`);
-  }
-
-  if (newItems.length > 0) {
-    console.log(`\n✨ NEW FROM THIS MESSAGE:`);
-    newItems.forEach(item => console.log(`     + ${item}`));
-  } else {
-    console.log(`\n💭 Nothing new detected`);
-  }
-
-  console.log(`\n   Sessions: ${profile.total_sessions} | Last active: ${profile.last_session}`);
-  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-}
-
-// ── Main process function ─────────────────────────────────
+// ── Main memory processor ─────────────────────────────────
 export async function processMessage(
   userText: string,
   profile: UserProfile,
-  apiKey: string,
-  tone: string = "neutral"
+  apiKey: string
 ): Promise<{ profile: UserProfile; newMemories: string[] }> {
   const newMemories: string[] = [];
-  const now = new Date().toISOString();
 
-  // Skip very short messages — not enough content to extract memory from
-  const wordCount = userText.trim().split(/\s+/).length;
-  if (wordCount < 5) {
-  // skip - no new memories
+  // Skip short messages
+  if (userText.trim().split(/\s+/).length < 4) {
     return { profile, newMemories };
   }
 
   const extracted = await extractMemory(userText, apiKey);
-  if (!extracted) {
-  // skip - no new memories
-    return { profile, newMemories };
-  }
+  if (!extracted) return { profile, newMemories };
 
-  // ── Neocortex ─────────────────────────────────────────
-  if (extracted.name && !profile.neocortex.name) {
-    profile.neocortex.name = extracted.name;
-    newMemories.push(`[NEOCORTEX] Name: ${extracted.name}`);
+  // Layer 1 — permanent profile
+  if (extracted.name && !profile.layer1.name) {
+    profile.layer1.name = extracted.name;
+    newMemories.push(`[PROFILE] Name: ${extracted.name}`);
   }
-  if (extracted.age && !profile.neocortex.age) {
-    profile.neocortex.age = extracted.age;
-    newMemories.push(`[NEOCORTEX] Age: ${extracted.age}`);
+  if (extracted.age && !profile.layer1.age) {
+    profile.layer1.age = extracted.age;
+    newMemories.push(`[PROFILE] Age: ${extracted.age}`);
   }
-  if (extracted.occupation && !profile.neocortex.occupation) {
-    profile.neocortex.occupation = extracted.occupation;
-    newMemories.push(`[NEOCORTEX] Occupation: ${extracted.occupation}`);
+  if (extracted.occupation && !profile.layer1.occupation) {
+    profile.layer1.occupation = extracted.occupation;
+    newMemories.push(`[PROFILE] Occupation: ${extracted.occupation}`);
   }
-  if (extracted.location && !profile.neocortex.location) {
-    profile.neocortex.location = extracted.location;
-    newMemories.push(`[NEOCORTEX] Location: ${extracted.location}`);
+  if (extracted.location && !profile.layer1.location) {
+    profile.layer1.location = extracted.location;
+    newMemories.push(`[PROFILE] Location: ${extracted.location}`);
   }
-  if (extracted.general_fact) {
-    const exists = profile.neocortex.facts.some(f =>
-      f.text.toLowerCase().includes(extracted.general_fact.toLowerCase().slice(0, 20))
-    );
+  if (extracted.goal) {
+    const exists = profile.layer1.goals.some(g => g.text.toLowerCase().includes(extracted.goal.toLowerCase().slice(0, 20)));
     if (!exists) {
-      profile.neocortex.facts.push(newEntry(extracted.general_fact));
-      newMemories.push(`[NEOCORTEX] Fact: ${extracted.general_fact}`);
+      const { profile: p } = addMemory(profile, extracted.goal, "layer1", "goals");
+      profile = p;
+      newMemories.push(`[LAYER 1 — GOAL] ${extracted.goal}`);
+    }
+  }
+  if (extracted.value) {
+    const exists = profile.layer1.values.some(v => v.text.toLowerCase().includes(extracted.value.toLowerCase().slice(0, 20)));
+    if (!exists) {
+      const { profile: p } = addMemory(profile, extracted.value, "layer1", "values");
+      profile = p;
+      newMemories.push(`[LAYER 1 — VALUE] ${extracted.value}`);
+    }
+  }
+  if (extracted.fear) {
+    const { profile: p } = addMemory(profile, extracted.fear, "layer1", "fears");
+    profile = p;
+    newMemories.push(`[LAYER 1 — FEAR/TRAUMA] ${extracted.fear}`);
+  }
+  if (extracted.achievement) {
+    const { profile: p } = addMemory(profile, extracted.achievement, "layer1", "achievements");
+    profile = p;
+    newMemories.push(`[LAYER 1 — ACHIEVEMENT] ${extracted.achievement}`);
+  }
+  if (extracted.relationship) {
+    const exists = profile.layer1.relationships.some(r => r.text.toLowerCase().includes(extracted.relationship.toLowerCase().slice(0, 20)));
+    if (!exists) {
+      const { profile: p } = addMemory(profile, extracted.relationship, "layer1", "relationships");
+      profile = p;
+      newMemories.push(`[LAYER 1 — RELATIONSHIP] ${extracted.relationship}`);
+    }
+  }
+  if (extracted.identity_fact) {
+    const exists = profile.layer1.identity.some(i => i.text.toLowerCase().includes(extracted.identity_fact.toLowerCase().slice(0, 20)));
+    if (!exists) {
+      const { profile: p } = addMemory(profile, extracted.identity_fact, "layer1", "identity");
+      profile = p;
+      newMemories.push(`[LAYER 1 — IDENTITY] ${extracted.identity_fact}`);
     }
   }
 
-  // ── Amygdala ──────────────────────────────────────────
-  if (extracted.trauma) {
-    profile.amygdala.traumas.push(newEntry(extracted.trauma));
-    newMemories.push(`[AMYGDALA] Trauma: ${extracted.trauma}`);
-  }
-  if (extracted.joy) {
-    profile.amygdala.joys.push(newEntry(extracted.joy));
-    newMemories.push(`[AMYGDALA] Joy: ${extracted.joy}`);
-  }
-  if (extracted.attachment) {
-    const exists = profile.amygdala.attachments.some(a =>
-      a.text.toLowerCase().includes(extracted.attachment.toLowerCase().slice(0, 20))
-    );
+  // Intermediate — 3 week
+  if (extracted.intermediate_topic) {
+    const exists = profile.intermediate.some(e => e.text.toLowerCase().includes(extracted.intermediate_topic.toLowerCase().slice(0, 20)));
     if (!exists) {
-      profile.amygdala.attachments.push(newEntry(extracted.attachment));
-      newMemories.push(`[AMYGDALA] Attachment: ${extracted.attachment}`);
+      const { profile: p } = addMemory(profile, extracted.intermediate_topic, "intermediate");
+      profile = p;
+      newMemories.push(`[INTERMEDIATE — 3 weeks] ${extracted.intermediate_topic}`);
     }
   }
 
-  // ── Basal Ganglia ─────────────────────────────────────
-  if (extracted.habit) {
-    const exists = profile.basal_ganglia.habits.some(h =>
-      h.text.toLowerCase().includes(extracted.habit.toLowerCase().slice(0, 20))
-    );
-    if (!exists) {
-      profile.basal_ganglia.habits.push(newEntry(extracted.habit));
-      newMemories.push(`[BASAL GANGLIA] Habit: ${extracted.habit}`);
-    }
-  }
-  if (extracted.interest) {
-    const exists = profile.basal_ganglia.interests.some(i =>
-      i.text.toLowerCase().includes(extracted.interest.toLowerCase().slice(0, 20))
-    );
-    if (!exists) {
-      profile.basal_ganglia.interests.push(newEntry(extracted.interest));
-      newMemories.push(`[BASAL GANGLIA] Interest: ${extracted.interest}`);
-    }
-  }
-  if (extracted.dislike) {
-    profile.basal_ganglia.dislikes.push(newEntry(extracted.dislike));
-    newMemories.push(`[BASAL GANGLIA] Dislike: ${extracted.dislike}`);
+  // Layer 2 — 3 day
+  if (extracted.fleeting_note) {
+    const { profile: p } = addMemory(profile, extracted.fleeting_note, "layer2");
+    profile = p;
+    newMemories.push(`[LAYER 2 — 3 days] ${extracted.fleeting_note}`);
   }
 
-  // ── Cerebellum ────────────────────────────────────────
-  if (extracted.skill) {
-    const exists = profile.cerebellum.skills.some(s =>
-      s.text.toLowerCase().includes(extracted.skill.toLowerCase().slice(0, 20))
-    );
-    if (!exists) {
-      profile.cerebellum.skills.push(newEntry(extracted.skill));
-      newMemories.push(`[CEREBELLUM] Skill: ${extracted.skill}`);
-    }
-  }
-
-  // ── Hippocampus ───────────────────────────────────────
-  if (extracted.event) {
-    profile.hippocampus.events.push(newEntry(extracted.event));
-    newMemories.push(`[HIPPOCAMPUS] Event: ${extracted.event}`);
-  }
-
-  // ── Keywords ─────────────────────────────────────────
-  const stopWords = ["you", "julia", "i", "me", "we", "he", "she", "they", "it"];
-  if (extracted.keywords && extracted.keywords.length > 0) {
+  // Keywords
+  const stopWords = new Set(["you", "julia", "i", "me", "we", "he", "she", "they", "it"]);
+  if (extracted.keywords?.length > 0) {
     extracted.keywords
-      .filter((w: string) => w && w.length > 1 && !stopWords.includes(w.toLowerCase()))
+      .filter((w: string) => w && w.length > 1 && !stopWords.has(w.toLowerCase()))
       .forEach((word: string) => {
-        const existing = profile.keywords.find(
-          k => k.word.toLowerCase() === word.toLowerCase()
-        );
-        if (existing) {
-          existing.times_seen++;
-          existing.tier = existing.times_seen >= 3 ? "long" : "intermediate";
-          newMemories.push(`[KEYWORDS] Bumped: ${word} (${existing.times_seen}x)`);
-        } else {
-          profile.keywords.push({
-            word,
-            description: "mentioned in conversation",
-            first_seen: now,
-            times_seen: 1,
-            tier: "short",
-          });
-          newMemories.push(`[KEYWORDS] New: ${word}`);
-        }
+        newMemories.push(`[KEYWORD] ${word}`);
       });
   }
 
+  // Purge expired
   profile = purgeExpired(profile);
-  profile = checkPromotions(profile);
-  profile.last_session = now;
+  profile.last_session = new Date().toISOString();
 
-  // Only print new detections
-  if (newMemories.length > 0) {
-    console.log("\n✨ NEW FROM THIS MESSAGE:");
-    newMemories.forEach(item => console.log(`     + ${item}`));
-    console.log('');
-  } else {
-    console.log("💭 Nothing new detected");
-  }
   return { profile, newMemories };
 }
 
-export async function detectTone(
-  messages: string[],
-  apiKey: string
-): Promise<"venting" | "calm" | "excited" | "neutral"> {
-  return "neutral";
-}
+// ── Print clean memory snapshot ───────────────────────────
+export function printMemorySnapshot(profile: UserProfile, newItems: string[]) {
+  console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log("🧠 JULIA MEMORY PROFILE");
+  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-export async function getOnboardingQuestion(
-  profile: UserProfile,
-  recentMessages: string[],
-  apiKey: string
-): Promise<string | null> {
-  return null;
+  const { layer1 } = profile;
+  console.log(`\n📌 LAYER 1 — PERMANENT PROFILE`);
+  console.log(`   Name: ${layer1.name || "unknown"} | Age: ${layer1.age || "unknown"} | Occupation: ${layer1.occupation || "unknown"} | Location: ${layer1.location || "unknown"}`);
+  if (layer1.identity.length)       { console.log(`   Identity:`);      layer1.identity.slice(-4).forEach(e => console.log(`     • ${e.text}`)); }
+  if (layer1.goals.length)          { console.log(`   Goals:`);         layer1.goals.slice(-4).forEach(e => console.log(`     • ${e.text}`)); }
+  if (layer1.values.length)         { console.log(`   Values:`);        layer1.values.slice(-3).forEach(e => console.log(`     • ${e.text}`)); }
+  if (layer1.achievements.length)   { console.log(`   Achievements:`);  layer1.achievements.slice(-4).forEach(e => console.log(`     • ${e.text}`)); }
+  if (layer1.fears.length)          { console.log(`   Fears/Trauma:`);  layer1.fears.slice(-3).forEach(e => console.log(`     • ${e.text}`)); }
+  if (layer1.relationships.length)  { console.log(`   Relationships:`); layer1.relationships.slice(-4).forEach(e => console.log(`     • ${e.text}`)); }
+
+  console.log(`\n🔄 INTERMEDIATE — Ongoing topics (3 weeks)`);
+  if (profile.intermediate.length) {
+    profile.intermediate.forEach(e => {
+      const exp = e.expires_at ? `expires ${new Date(e.expires_at).toLocaleDateString()}` : "";
+      console.log(`     • ${e.text} ${exp ? `(${exp})` : ""}`);
+    });
+  } else console.log(`   (none)`);
+
+  console.log(`\n💬 LAYER 2 — Recent conversation (3 days)`);
+  if (profile.layer2.length) {
+    profile.layer2.forEach(e => {
+      const exp = e.expires_at ? `expires ${new Date(e.expires_at).toLocaleDateString()}` : "";
+      console.log(`     • ${e.text} ${exp ? `(${exp})` : ""}`);
+    });
+  } else console.log(`   (none)`);
+
+  if (newItems.length > 0) {
+    console.log(`\n✨ NEW FROM THIS CONVERSATION:`);
+    newItems.forEach(item => console.log(`   + ${item}`));
+  }
+
+  console.log(`\n   Sessions: ${profile.total_sessions} | Last: ${profile.last_session}`);
+  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 }

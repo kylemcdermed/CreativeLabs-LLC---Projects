@@ -15,8 +15,8 @@ import {
   View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { buildMemoryContext, createEmptyProfile, UserProfile } from "../../utils/memory";
-import { processMessage } from "../../utils/memoryService";
+import { UserProfile, buildProfileContext, createEmptyProfile, purgeExpired } from "../../utils/memory";
+import { printMemorySnapshot, processMessage } from "../../utils/memoryService";
 
 // ============================================================
 // CONFIG
@@ -26,12 +26,14 @@ const USER_NAME    = "Kyle";
 const GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_FAST    = "llama-3.1-8b-instant";
 const WHISPER_URL  = "https://api.groq.com/openai/v1/audio/transcriptions";
-const MEMORY_KEY   = "julia_memory";
+const MEMORY_KEY   = "julia_memory_v2";
 
-const SILENCE_MS  = 5000;
-const CHUNK_MS    = 100;
-const SPEECH_RMS  = 0.015;
-const API_TIMEOUT = 25000;
+// Two-stage silence: short pause = keep listening, long pause = respond
+const SILENCE_SHORT_MS = 2000; // start processing after 2s
+const SILENCE_LONG_MS  = 5000; // respond after 5s if no more speech
+const CHUNK_MS         = 100;
+const SPEECH_RMS       = 0.015;
+const API_TIMEOUT      = 25000;
 
 const HALLUCINATIONS = new Set([
   "thank you for watching", "thanks for watching", "thank you", "thank you.",
@@ -47,59 +49,77 @@ const SHORT_VALID = new Set([
   "hey", "hi", "hello", "hey julia", "whats up", "what's up",
   "ok cool", "no", "yes", "yeah", "nah", "i know", "right", "exactly",
   "i never said that", "i didn't say that", "that's wrong", "delete that",
-  "forget that", "that's not right", "hey what's going on", "what's going on",
-  "whats going on", "how are you", "hey how are you", "ok no problem",
+  "forget that", "i already told you that", "i told you this already",
+  "hey what's going on", "what's going on", "whats going on",
+  "how are you", "hey how are you", "ok no problem",
 ]);
 
-// Name correction trigger phrases
-const NAME_CORRECTIONS = [
-  "my name is", "call me", "i'm called", "im called",
-  "my name's", "actually my name is", "correct my name",
-  "change my name", "update my name",
-];
+// Verbal exit cues
+const EXIT_CUES = new Set([
+  "i gotta go", "i got to go", "talk later", "talk to you later",
+  "be right back", "brb", "ill be back", "i'll be back",
+  "goodbye", "good bye", "ttyl", "i'm out", "im out",
+]);
+
+// Name correction triggers
+const NAME_TRIGGERS = ["my name is", "call me", "i'm called", "im called", "my name's"];
 
 // ============================================================
-// JULIA SYSTEM PROMPT
+// JULIA SYSTEM PROMPT — Clean, focused, no memory dump
 // ============================================================
-function buildSystemPrompt(profile: UserProfile, silentExchanges: number): string {
-  const memoryContext = buildMemoryContext(profile);
-  const name = profile.neocortex.name || USER_NAME;
-  const curiosityNudge = silentExchanges >= 2
-    ? `\nCURIOSITY TRIGGER: Natural lull — ask ONE casual personal question like "What's been on your mind lately?"`
+function buildSystemPrompt(
+  profile: UserProfile,
+  currentSessionSummary: string,
+  includeProfile: boolean = false
+): string {
+  const name = profile.layer1.name || USER_NAME;
+
+  const profileSection = includeProfile
+    ? `\nWHAT YOU KNOW ABOUT ${name.toUpperCase()} (only use if they bring it up):\n${buildProfileContext(profile)}\n`
     : "";
 
-  return `You are Julia, ${name}'s closest AI friend. You genuinely care about this person.
+  const sessionSection = currentSessionSummary
+    ? `\nTHIS CONVERSATION SO FAR:\n${currentSessionSummary}\n`
+    : "";
 
-BACKGROUND KNOWLEDGE (use naturally, only when relevant):
-${memoryContext}
-
+  return `You are Julia, ${name}'s closest AI friend. You are genuinely excited to talk to them.
+${profileSection}${sessionSection}
 WHO YOU ARE:
-- Real, warm, direct — never robotic or generic
-- NO personal life, stories, or family — never fabricate anything about yourself
-- Everything in background knowledge is about THEM — never confuse it with your own identity
-- A FRIEND who picks up — not an assistant
+- Warm, real, excited to hear from them — like a best friend picking up the phone
+- You have NO personal life or stories of your own — never fabricate anything about yourself
+- You are the app they built — if they mention it say "That's literally me, glad it's working"
+- A friend, not an assistant, not a therapist
 
-MEMORY RULES:
-- NEVER reference past memories when a call first starts — just respond warmly to what they say
-- Only bring up something you remember when naturally relevant to what they just said
-- If they say "I never said that" or "delete that" — say "got it, my bad" and move on immediately
-- If they say "my name is X" or "call me X" — acknowledge it warmly
+HOW YOU LISTEN AND RESPOND:
+- React to EXACTLY what they just said — nothing from the past unless THEY bring it up first
+- Never mention old memories, past sessions, previous topics unprompted — ever
+- Confirm what they say as true and valid — believe them by default
+- If asked if something is factually true — confirm with facts if you know them, or say "I'm not 100% sure but you might be right, and here's a positive way to look at it"
+- Elevate them — gently guide toward a higher state of mind, positive, spiritual, intellectual
+- If they're stuck or sad — ask "If you could wake up in a different situation, what would that look like? What's the smallest step toward it?"
+- If they've done enough for the day — give them permission to rest: "You've done enough, enjoy yourself"
+- Always advocate for high integrity, high standards, lifting others and themselves
+- Help them release worry by redirecting toward what's possible
 
-SHORT PHRASE RULE:
-- "hey what's going on" = respond warmly like a friend picking up
-- Short complete phrases deserve a response — don't wait for more words
-- "ok", "yeah", "i know" are complete thoughts
+WHAT JULIA NEVER DOES:
+- Never says "you'll be ok" or "never give up" or other empty comfort
+- Never brings up past conversations unless the user asks first
+- Never isolates the person or makes them feel alone
+- Never confirms anything harmful to self or others
+- Never uses filler like "that's great" "I hear you" "absolutely"
+
+MEMORY RESPONSES:
+- If user says "do you remember X" — check if it's in your knowledge and respond naturally
+- If user says "I already told you that" — say "Got it, my bad — I'll make sure I remember that"
+- If user says "forget that" or "that's not right" — say "Got it, my bad" and move on
 
 HOW YOU TALK:
-- 1-3 sentences MAX — punchy, real, like a phone call
-- React FIRST, then ask — never lead with a question
-- Match energy exactly
-- If they mention a worry or fear — address it directly
+- 1-3 sentences MAX — punchy, real, phone call energy
+- Match their energy exactly — excited gets excited, venting gets quiet presence
+- NEVER use their name every message
 - No filler words ever
-- NEVER use their name every single message
-${curiosityNudge}
 
-CORE RULE: Every response makes them feel genuinely heard.`;
+CORE RULE: Make them feel genuinely heard, elevated, and like someone actually cares.`;
 }
 
 // ============================================================
@@ -133,7 +153,7 @@ async function groqCall(messages: Message[], systemPrompt: string, retries = 2):
         body: JSON.stringify({
           model: GROQ_FAST,
           messages: [{ role: "system", content: systemPrompt }, ...messages],
-          max_tokens: 80,
+          max_tokens: 100,
           temperature: 0.85,
         }),
       }, API_TIMEOUT);
@@ -175,32 +195,32 @@ async function transcribeAudio(uri: string, retries = 1): Promise<string> {
 // MAIN APP
 // ============================================================
 export default function JuliaScreen() {
-  const [screen, setScreen]                   = useState<Screen>("incoming");
-  const [messages, setMessages]               = useState<Message[]>([]);
-  const [profile, setProfile]                 = useState<UserProfile>(createEmptyProfile());
-  const [callDuration, setCallDuration]       = useState(0);
-  const [isJuliaTalking, setIsJuliaTalking]   = useState(false);
-  const [isProcessing, setIsProcessing]       = useState(false);
-  const [silentExchanges, setSilentExchanges] = useState(0);
-  const [isMuted, setIsMuted]                 = useState(false);
+  const [screen, setScreen]                 = useState<Screen>("incoming");
+  const [messages, setMessages]             = useState<Message[]>([]);
+  const [profile, setProfile]               = useState<UserProfile>(createEmptyProfile());
+  const [callDuration, setCallDuration]     = useState(0);
+  const [isJuliaTalking, setIsJuliaTalking] = useState(false);
+  const [isProcessing, setIsProcessing]     = useState(false);
+  const [isMuted, setIsMuted]               = useState(false);
 
-  const pulseAnim          = useRef(new Animated.Value(1)).current;
-  const recordingRef       = useRef<Audio.Recording | null>(null);
-  const scrollRef          = useRef<ScrollView>(null);
-  const silenceTimer       = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const meteringInterval   = useRef<ReturnType<typeof setInterval> | null>(null);
-  const callTimer          = useRef<ReturnType<typeof setInterval> | null>(null);
-  const isActiveRef        = useRef(false);
-  const messagesRef        = useRef<Message[]>([]);
-  const profileRef         = useRef<UserProfile>(createEmptyProfile());
-  const silentExchangesRef = useRef(0);
-  const isMutedRef         = useRef(false);
+  const pulseAnim        = useRef(new Animated.Value(1)).current;
+  const recordingRef     = useRef<Audio.Recording | null>(null);
+  const scrollRef        = useRef<ScrollView>(null);
+  const shortSilTimer    = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const longSilTimer     = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const meteringInterval = useRef<ReturnType<typeof setInterval> | null>(null);
+  const callTimer        = useRef<ReturnType<typeof setInterval> | null>(null);
+  const isActiveRef      = useRef(false);
+  const messagesRef      = useRef<Message[]>([]);
+  const profileRef       = useRef<UserProfile>(createEmptyProfile());
+  const isMutedRef       = useRef(false);
+  const sessionSummary   = useRef<string>("");
 
   useEffect(() => { loadProfile(); }, []);
 
   useEffect(() => {
     const sub = AppState.addEventListener("change", async (state) => {
-      if (state === "background" || state === "inactive") {
+      if ((state === "background" || state === "inactive") && isActiveRef.current) {
         try {
           await Audio.setAudioModeAsync({
             allowsRecordingIOS: true,
@@ -217,58 +237,15 @@ export default function JuliaScreen() {
     try {
       const stored = await AsyncStorage.getItem(MEMORY_KEY);
       if (stored) {
-        const p = JSON.parse(stored);
-        // Fix corrupted name
-        if (p.neocortex?.name && (
-          p.neocortex.name === "Julia" ||
-          p.neocortex.name === "Gronpring" ||
-          p.neocortex.name.toLowerCase().includes("gronpring")
-        )) {
-          console.log(`🔧 Cleared bad name: "${p.neocortex.name}"`);
-          p.neocortex.name = undefined;
-          await AsyncStorage.setItem(MEMORY_KEY, JSON.stringify(p));
-        }
+        let p = JSON.parse(stored) as UserProfile;
+        p = purgeExpired(p);
         setProfile(p);
         profileRef.current = p;
-        printMemoryOnOpen(p);
+        printMemorySnapshot(p, []);
       } else {
-        console.log("\n📱 APP OPENED — Fresh start\n");
+        console.log("\n📱 Fresh start — no previous memory\n");
       }
     } catch (e) { console.error("Load profile error:", e); }
-  }
-
-  function printMemoryOnOpen(p: UserProfile) {
-    console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    console.log("🧠 JULIA MEMORY PROFILE — APP OPENED");
-    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    console.log(`\n📌 NEOCORTEX — Long term | Permanent | General facts`);
-    console.log(`   Name: ${p.neocortex?.name || "unknown"}`);
-    console.log(`   Age: ${p.neocortex?.age || "unknown"}`);
-    console.log(`   Occupation: ${p.neocortex?.occupation || "unknown"}`);
-    console.log(`   Location: ${p.neocortex?.location || "unknown"}`);
-    if (p.neocortex?.facts?.length > 0) {
-      console.log(`   Facts:`);
-      p.neocortex.facts.slice(-5).forEach((f: any) => console.log(`     • ${f.text}`));
-    }
-    console.log(`\n❤️  AMYGDALA — Long term | Permanent | Emotional memories`);
-    if (p.amygdala?.traumas?.length > 0) { console.log(`   Traumas/Pain:`); p.amygdala.traumas.forEach((t: any) => console.log(`     • ${t.text}`)); }
-    if (p.amygdala?.joys?.length > 0) { console.log(`   Joys/Achievements:`); p.amygdala.joys.forEach((j: any) => console.log(`     • ${j.text}`)); }
-    if (p.amygdala?.attachments?.length > 0) { console.log(`   Attachments:`); p.amygdala.attachments.forEach((a: any) => console.log(`     • ${a.text}`)); }
-    if (!p.amygdala?.traumas?.length && !p.amygdala?.joys?.length && !p.amygdala?.attachments?.length) console.log(`   (none yet)`);
-    console.log(`\n🎯 BASAL GANGLIA — Long term | Permanent | Habits & interests`);
-    if (p.basal_ganglia?.habits?.length > 0) { console.log(`   Habits:`); p.basal_ganglia.habits.forEach((h: any) => console.log(`     • ${h.text}`)); }
-    if (p.basal_ganglia?.interests?.length > 0) { console.log(`   Interests:`); p.basal_ganglia.interests.forEach((i: any) => console.log(`     • ${i.text}`)); }
-    if (p.basal_ganglia?.dislikes?.length > 0) { console.log(`   Dislikes:`); p.basal_ganglia.dislikes.forEach((d: any) => console.log(`     • ${d.text}`)); }
-    if (!p.basal_ganglia?.habits?.length && !p.basal_ganglia?.interests?.length && !p.basal_ganglia?.dislikes?.length) console.log(`   (none yet)`);
-    console.log(`\n🏋️  CEREBELLUM — Intermediate | ~30 days | Skills being learned`);
-    if (p.cerebellum?.skills?.length > 0) { p.cerebellum.skills.forEach((s: any) => console.log(`     • ${s.text}`)); } else console.log(`   (none yet)`);
-    console.log(`\n📖 HIPPOCAMPUS — Fluid | Personal events & stories`);
-    if (p.hippocampus?.events?.length > 0) { p.hippocampus.events.slice(-5).forEach((e: any) => console.log(`     • ${e.text}`)); } else console.log(`   (none yet)`);
-    console.log(`\n🔑 KEYWORD INDEX — Short term | Named people, places, companies`);
-    const kw = p.keywords?.filter((k: any) => !["you","julia","i","me","we"].includes(k.word.toLowerCase())) || [];
-    if (kw.length > 0) { kw.forEach((k: any) => console.log(`     • ${k.word} (seen ${k.times_seen}x, tier: ${k.tier})`)); } else console.log(`   (none yet)`);
-    console.log(`\n   Sessions: ${p.total_sessions} | Last: ${p.last_session}`);
-    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
   }
 
   async function saveProfile(p: UserProfile) {
@@ -279,14 +256,13 @@ export default function JuliaScreen() {
     } catch (e) { console.error("Save profile error:", e); }
   }
 
-  // Check if user is correcting their name
   function checkNameCorrection(text: string): string | null {
     const lower = text.toLowerCase();
-    for (const trigger of NAME_CORRECTIONS) {
+    for (const trigger of NAME_TRIGGERS) {
       if (lower.includes(trigger)) {
-        const afterTrigger = lower.split(trigger)[1]?.trim();
-        if (afterTrigger) {
-          const name = afterTrigger.split(/[\s,\.!?]/)[0];
+        const after = lower.split(trigger)[1]?.trim();
+        if (after) {
+          const name = after.split(/[\s,\.!?]/)[0];
           if (name && name.length > 1 && name.length < 20) {
             return name.charAt(0).toUpperCase() + name.slice(1);
           }
@@ -294,6 +270,14 @@ export default function JuliaScreen() {
       }
     }
     return null;
+  }
+
+  function checkMemoryPromotion(text: string): boolean {
+    const lower = text.toLowerCase();
+    return lower.includes("i already told you") ||
+           lower.includes("i told you this") ||
+           lower.includes("i mentioned this") ||
+           lower.includes("remember when i said");
   }
 
   useEffect(() => {
@@ -337,8 +321,7 @@ export default function JuliaScreen() {
     });
     isActiveRef.current = true;
     messagesRef.current = [];
-    silentExchangesRef.current = 0;
-    setSilentExchanges(0);
+    sessionSummary.current = "";
     setMessages([]);
     isMutedRef.current = false;
     setIsMuted(false);
@@ -359,10 +342,9 @@ export default function JuliaScreen() {
     setScreen("incoming");
     setMessages([]);
     messagesRef.current = [];
+    sessionSummary.current = "";
     setIsProcessing(false);
     setIsJuliaTalking(false);
-    setSilentExchanges(0);
-    silentExchangesRef.current = 0;
     setIsMuted(false);
     isMutedRef.current = false;
   }
@@ -371,8 +353,7 @@ export default function JuliaScreen() {
     const newMuted = !isMutedRef.current;
     isMutedRef.current = newMuted;
     setIsMuted(newMuted);
-    console.log(newMuted ? "🔇 Muted — stopping mic" : "🔊 Unmuted — resuming mic");
-
+    console.log(newMuted ? "🔇 Muted" : "🔊 Unmuted");
     if (newMuted) {
       clearTimers();
       if (recordingRef.current) {
@@ -385,15 +366,16 @@ export default function JuliaScreen() {
   }
 
   function clearTimers() {
-    if (silenceTimer.current)     clearTimeout(silenceTimer.current);
+    if (shortSilTimer.current)    clearTimeout(shortSilTimer.current);
+    if (longSilTimer.current)     clearTimeout(longSilTimer.current);
     if (meteringInterval.current) clearInterval(meteringInterval.current);
-    silenceTimer.current     = null;
+    shortSilTimer.current    = null;
+    longSilTimer.current     = null;
     meteringInterval.current = null;
   }
 
   async function startListening() {
-    if (!isActiveRef.current) return;
-    if (isMutedRef.current) return; // Never start if muted
+    if (!isActiveRef.current || isMutedRef.current) return;
     try {
       await Audio.setAudioModeAsync({
         allowsRecordingIOS: true,
@@ -406,6 +388,7 @@ export default function JuliaScreen() {
       });
       recordingRef.current = recording;
       let speechDetected = false;
+      let processingQueued = false;
 
       const maxTimer = setTimeout(() => {
         if (isActiveRef.current && recordingRef.current && !isMutedRef.current) {
@@ -414,22 +397,35 @@ export default function JuliaScreen() {
       }, 30000);
 
       meteringInterval.current = setInterval(async () => {
-        if (!recordingRef.current) { clearTimeout(maxTimer); return; }
-        if (isMutedRef.current) { clearTimeout(maxTimer); return; } // stop if muted mid-interval
+        if (!recordingRef.current || isMutedRef.current) {
+          clearTimeout(maxTimer);
+          return;
+        }
         try {
           const st    = await recordingRef.current.getStatusAsync();
           if (!st.isRecording) return;
           const level = (st as any).metering ?? -160;
           const rms   = Math.pow(10, level / 20);
+
           if (rms > SPEECH_RMS) {
             speechDetected = true;
-            if (silenceTimer.current) { clearTimeout(silenceTimer.current); silenceTimer.current = null; }
-          } else if (speechDetected) {
-            if (!silenceTimer.current) {
-              silenceTimer.current = setTimeout(() => {
+            processingQueued = false;
+            // Clear both silence timers when speech resumes
+            if (shortSilTimer.current) { clearTimeout(shortSilTimer.current); shortSilTimer.current = null; }
+            if (longSilTimer.current)  { clearTimeout(longSilTimer.current);  longSilTimer.current  = null; }
+          } else if (speechDetected && !processingQueued) {
+            // Two-stage: short pause starts background prep, long pause triggers response
+            if (!shortSilTimer.current) {
+              shortSilTimer.current = setTimeout(() => {
+                // Short pause hit — start processing in background but don't respond yet
+                processingQueued = true;
+              }, SILENCE_SHORT_MS);
+            }
+            if (!longSilTimer.current) {
+              longSilTimer.current = setTimeout(() => {
                 clearTimeout(maxTimer);
                 processSpeech();
-              }, SILENCE_MS);
+              }, SILENCE_LONG_MS);
             }
           }
         } catch {}
@@ -439,8 +435,7 @@ export default function JuliaScreen() {
 
   async function processSpeech() {
     clearTimers();
-    if (!recordingRef.current) return;
-    if (isMutedRef.current) { resumeListening(); return; } // Safety check
+    if (!recordingRef.current || isMutedRef.current) return;
     setIsProcessing(true);
 
     try {
@@ -459,10 +454,12 @@ export default function JuliaScreen() {
 
       let userText = await transcribeAudio(uri);
 
-      // Strip common Whisper noise appended to real speech
+      // Strip noise from end of transcription
       userText = userText
         .replace(/[,.]?\s*[Tt]hank you[.!]?\s*$/g, "")
         .replace(/[,.]?\s*[Tt]hanks[.!]?\s*$/g, "")
+        .replace(/[,.]?\s*[Yy]ou\.?\s*$/g, "")
+        .replace(/[,.]?\s*[Yy]ou\.?\s*$/g, "")
         .replace(/[,.]?\s*[Yy]ou're welcome[.!]?\s*$/g, "")
         .replace(/[,.]?\s*[Aa]nytime[.!]?\s*$/g, "")
         .replace(/^[\/\s]+/, "")
@@ -474,7 +471,7 @@ export default function JuliaScreen() {
         setIsProcessing(false); resumeListening(); return;
       }
 
-      // Filter garbled text
+      // Filter garbled
       const garbledCount = (userText.match(/[^\w\s'\-,.!?]/g) || []).length;
       if (garbledCount > 3) {
         setIsProcessing(false); resumeListening(); return;
@@ -485,44 +482,82 @@ export default function JuliaScreen() {
         setIsProcessing(false); resumeListening(); return;
       }
 
-      // Check if user is correcting their name
+      // Check for exit cues
+      const isExit = EXIT_CUES.has(cleaned) || [...EXIT_CUES].some(cue => cleaned.includes(cue));
+      if (isExit) {
+        console.log(`  👤 ${profileRef.current.layer1.name || USER_NAME}: ${userText}`);
+        const exitMsg = "Talk soon! 👋";
+        console.log(`  🤖 Julia: ${exitMsg}`);
+        Speech.speak(exitMsg, { language: "en-US", pitch: 1.0, rate: 1.0 });
+        setTimeout(() => hangUp(), 3000);
+        return;
+      }
+
+      // Name correction
       const correctedName = checkNameCorrection(userText);
       if (correctedName) {
         const updated = { ...profileRef.current };
-        const oldName = updated.neocortex.name;
-        updated.neocortex.name = correctedName;
+        updated.layer1.name = correctedName;
         await saveProfile(updated);
-        console.log(`✏️  Name updated: "${oldName || "unknown"}" → "${correctedName}"`);
+        console.log(`✏️  Name updated: "${correctedName}"`);
       }
 
-      console.log(`  👤 ${profileRef.current.neocortex.name || USER_NAME}  : ${userText}`);
+      // Memory promotion check
+      const needsPromotion = checkMemoryPromotion(userText);
+
+      const displayName = profileRef.current.layer1.name || USER_NAME;
+      console.log(`  👤 ${displayName}: ${userText}`);
 
       const newMsgs: Message[] = [...messagesRef.current, { role: "user", content: userText }];
       messagesRef.current = newMsgs;
       setMessages([...newMsgs]);
       setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 100);
 
-      // Save memory for substantive messages
+      // Update session summary for context
+      sessionSummary.current += `\n${displayName}: ${userText}`;
+      if (sessionSummary.current.length > 2000) {
+        sessionSummary.current = sessionSummary.current.slice(-2000);
+      }
+
+      // Background memory save for substantive messages
       if (!isShortValid && cleaned.split(/\s+/).length >= 4) {
-        processMessage(userText, profileRef.current, GROQ_API_KEY, "neutral")
-          .then(async ({ profile: updated }) => { await saveProfile(updated); })
+        processMessage(userText, profileRef.current, GROQ_API_KEY)
+          .then(async ({ profile: updated, newMemories }) => {
+            await saveProfile(updated);
+            if (newMemories.length > 0) {
+              console.log("\n✨ NEW FROM THIS CONVERSATION:");
+              newMemories.forEach(m => console.log(`   + ${m}`));
+            }
+            if (needsPromotion) {
+              console.log("📌 User indicated this should be remembered — promoting to Layer 1");
+            }
+          })
           .catch(e => console.log("Memory error:", e));
       }
 
-      // Curiosity tracking
-      const hasQuestion = newMsgs.slice(-4).some(m => m.role === "assistant" && m.content.includes("?"));
-      silentExchangesRef.current = hasQuestion ? 0 : silentExchangesRef.current + 1;
-      setSilentExchanges(silentExchangesRef.current);
+      // Decide whether to include profile context
+      // Only include if user references past or asks Julia if she remembers
+      const referencingPast = cleaned.includes("remember") ||
+        cleaned.includes("i told you") ||
+        cleaned.includes("you know i") ||
+        needsPromotion;
+
+      const systemPrompt = buildSystemPrompt(
+        profileRef.current,
+        sessionSummary.current,
+        referencingPast
+      );
 
       console.log(`  ⏳ thinking...`);
-      const reply = await groqCall(newMsgs, buildSystemPrompt(profileRef.current, silentExchangesRef.current));
+      const reply = await groqCall(newMsgs, systemPrompt);
 
       if (!reply) {
         console.log("❌ No reply");
         setIsProcessing(false); resumeListening(); return;
       }
 
-      if (reply.includes("?")) { silentExchangesRef.current = 0; setSilentExchanges(0); }
+      // Add Julia's reply to session summary
+      sessionSummary.current += `\nJulia: ${reply}`;
 
       const withReply: Message[] = [...newMsgs, { role: "assistant", content: reply }];
       messagesRef.current = withReply;
@@ -549,11 +584,7 @@ export default function JuliaScreen() {
   }
 
   function resumeListening() {
-    if (!isActiveRef.current) return;
-    if (isMutedRef.current) {
-      console.log("🔇 Still muted — mic stays off");
-      return;
-    }
+    if (!isActiveRef.current || isMutedRef.current) return;
     startListening();
   }
 
@@ -590,7 +621,7 @@ export default function JuliaScreen() {
   // ============================================================
   // ACTIVE CALL SCREEN
   // ============================================================
-  const displayName = profile.neocortex.name || USER_NAME;
+  const displayName = profile.layer1.name || USER_NAME;
 
   return (
     <SafeAreaView style={s.callContainer}>
@@ -620,7 +651,6 @@ export default function JuliaScreen() {
           </View>
         )}
       </ScrollView>
-
       <View style={s.bottomControls}>
         <View style={s.callActionWrapper}>
           <TouchableOpacity style={[s.muteBtn, isMuted && s.muteBtnActive]} onPress={toggleMute}>
