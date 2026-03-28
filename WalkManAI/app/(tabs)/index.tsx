@@ -29,8 +29,9 @@ const WHISPER_URL  = "https://api.groq.com/openai/v1/audio/transcriptions";
 const MEMORY_KEY   = "julia_memory_v2";
 
 // Two-stage silence: short pause = keep listening, long pause = respond
-const SILENCE_SHORT_MS = 2000; // start processing after 2s
-const SILENCE_LONG_MS  = 5000; // respond after 5s if no more speech
+const SILENCE_SHORT_MS = 2000;  // start processing after 2s
+const SILENCE_LONG_MS  = 8000;  // respond after 8s — enough for long thoughts
+const SILENCE_FIRST_MS = 3000;  // first message responds faster
 const CHUNK_MS         = 100;
 const SPEECH_RMS       = 0.015;
 const API_TIMEOUT      = 25000;
@@ -70,7 +71,8 @@ const NAME_TRIGGERS = ["my name is", "call me", "i'm called", "im called", "my n
 function buildSystemPrompt(
   profile: UserProfile,
   currentSessionSummary: string,
-  includeProfile: boolean = false
+  includeProfile: boolean = false,
+  profileGapQuestion: string | null = null
 ): string {
   const name = profile.layer1.name || USER_NAME;
 
@@ -119,7 +121,8 @@ HOW YOU TALK:
 - NEVER use their name every message
 - No filler words ever
 
-CORE RULE: Make them feel genuinely heard, elevated, and like someone actually cares.`;
+CORE RULE: Make them feel genuinely heard, elevated, and like someone actually cares.
+${profileGapQuestion ? `\nPROFILE BUILDING: Conversation has had a natural pause and you want to know them better. Weave this question naturally into your response — make it feel like genuine curiosity, not an interview: "${profileGapQuestion}"` : ""}`;
 }
 
 // ============================================================
@@ -153,7 +156,7 @@ async function groqCall(messages: Message[], systemPrompt: string, retries = 2):
         body: JSON.stringify({
           model: GROQ_FAST,
           messages: [{ role: "system", content: systemPrompt }, ...messages],
-          max_tokens: 100,
+          max_tokens: 80,
           temperature: 0.85,
         }),
       }, API_TIMEOUT);
@@ -256,6 +259,25 @@ export default function JuliaScreen() {
     } catch (e) { console.error("Save profile error:", e); }
   }
 
+  // Detect what profile information is still missing and generate a natural question
+  function getProfileGapQuestion(profile: UserProfile): string | null {
+    const l1 = profile.layer1;
+
+    // Priority order of what to learn about the person
+    if (!l1.name) return "I'd love to know your name — what do you go by?";
+    if (!l1.occupation) return "What do you do for work, or what are you working toward?";
+    if (!l1.location) return "Where are you based out of?";
+    if (!l1.age) return "How old are you if you don't mind me asking?";
+    if (l1.goals.length === 0) return "What's the big thing you're working toward right now in life?";
+    if (l1.values.length === 0) return "What matters most to you in life?";
+    if (l1.relationships.length === 0) return "Tell me about the people closest to you — family, friends, anyone important?";
+    if (l1.fears.length === 0) return "What's something you're currently struggling with or worried about?";
+    if (l1.achievements.length === 0) return "What's something you're genuinely proud of that you've accomplished?";
+    if (l1.identity.length < 2) return "Where did you grow up — what's your background?";
+
+    return null; // Profile is full enough
+  }
+
   function checkNameCorrection(text: string): string | null {
     const lower = text.toLowerCase();
     for (const trigger of NAME_TRIGGERS) {
@@ -318,6 +340,10 @@ export default function JuliaScreen() {
       allowsRecordingIOS: true,
       playsInSilentModeIOS: true,
       staysActiveInBackground: true,
+      interruptionModeIOS: 1,
+      shouldDuckAndroid: false,
+      interruptionModeAndroid: 1,
+      playThroughEarpieceAndroid: false,
     });
     isActiveRef.current = true;
     messagesRef.current = [];
@@ -328,6 +354,8 @@ export default function JuliaScreen() {
     setScreen("call");
     const updated = { ...profileRef.current, total_sessions: profileRef.current.total_sessions + 1 };
     await saveProfile(updated);
+    // Warm up Groq connection so first response is fast
+    groqCall([{ role: "user", content: "hi" }], "Say exactly: ready").catch(() => {});
     startListening();
   }
 
@@ -410,22 +438,21 @@ export default function JuliaScreen() {
           if (rms > SPEECH_RMS) {
             speechDetected = true;
             processingQueued = false;
-            // Clear both silence timers when speech resumes
             if (shortSilTimer.current) { clearTimeout(shortSilTimer.current); shortSilTimer.current = null; }
             if (longSilTimer.current)  { clearTimeout(longSilTimer.current);  longSilTimer.current  = null; }
           } else if (speechDetected && !processingQueued) {
-            // Two-stage: short pause starts background prep, long pause triggers response
             if (!shortSilTimer.current) {
               shortSilTimer.current = setTimeout(() => {
-                // Short pause hit — start processing in background but don't respond yet
                 processingQueued = true;
               }, SILENCE_SHORT_MS);
             }
             if (!longSilTimer.current) {
+              // First message responds faster, subsequent messages get full window
+              const silenceWindow = messagesRef.current.length === 0 ? SILENCE_FIRST_MS : SILENCE_LONG_MS;
               longSilTimer.current = setTimeout(() => {
                 clearTimeout(maxTimer);
                 processSpeech();
-              }, SILENCE_LONG_MS);
+              }, silenceWindow);
             }
           }
         } catch {}
@@ -447,7 +474,9 @@ export default function JuliaScreen() {
 
       try {
         const fileInfo = await FileSystem.getInfoAsync(uri);
-        if (fileInfo.exists && (fileInfo as any).size < 20000) {
+        // First message gets lower threshold since greetings are short
+        const minSize = messagesRef.current.length === 0 ? 8000 : 20000;
+        if (fileInfo.exists && (fileInfo as any).size < minSize) {
           setIsProcessing(false); resumeListening(); return;
         }
       } catch {}
@@ -475,6 +504,19 @@ export default function JuliaScreen() {
       const garbledCount = (userText.match(/[^\w\s'\-,.!?]/g) || []).length;
       if (garbledCount > 3) {
         setIsProcessing(false); resumeListening(); return;
+      }
+
+      // Incomplete thought detection — if last word is a connector, keep listening
+      const INCOMPLETE_ENDERS = new Set(["and", "but", "because", "so", "also", "or",
+        "then", "like", "that", "with", "for", "to", "a", "the", "in", "of", "it",
+        "just", "about", "when", "if", "what", "how", "who", "there", "i"]);
+      const words = userText.toLowerCase().trim().split(/\s+/);
+      const lastWord = (words[words.length - 1] || "").replace(/[^a-z]/g, "");
+      if (words.length > 3 && INCOMPLETE_ENDERS.has(lastWord)) {
+        console.log(`  ⏸️  Incomplete thought ("...${lastWord}") — listening for more`);
+        setIsProcessing(false);
+        resumeListening();
+        return;
       }
 
       const isShortValid = SHORT_VALID.has(cleaned);
@@ -542,11 +584,19 @@ export default function JuliaScreen() {
         cleaned.includes("you know i") ||
         needsPromotion;
 
-      const systemPrompt = buildSystemPrompt(
-        profileRef.current,
-        sessionSummary.current,
-        referencingPast
-      );
+      // First message gets a lighter prompt for faster response
+      const isFirstMessage = newMsgs.filter(m => m.role === "user").length === 1;
+      // Check if we should ask a profile-building question
+      // Only ask after at least 2 exchanges and when conversation has a natural lull
+      const exchangeCount = newMsgs.filter(m => m.role === "user").length;
+      const lastJuliaMsg = messagesRef.current.filter(m => m.role === "assistant").slice(-1)[0]?.content || "";
+      const juliaJustAsked = lastJuliaMsg.includes("?");
+      const shouldAskProfile = exchangeCount >= 2 && !juliaJustAsked && exchangeCount % 3 === 0;
+      const profileGap = shouldAskProfile ? getProfileGapQuestion(profileRef.current) : null;
+
+      const systemPrompt = isFirstMessage
+        ? `You are Julia, a warm AI best friend. Someone just said hi or asked how you are. Respond with ONE short excited sentence like a friend picking up the phone. No questions yet. Just warm energy.`
+        : buildSystemPrompt(profileRef.current, sessionSummary.current, referencingPast, profileGap);
 
       console.log(`  ⏳ thinking...`);
       const reply = await groqCall(newMsgs, systemPrompt);
